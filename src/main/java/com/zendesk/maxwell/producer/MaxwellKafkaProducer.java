@@ -6,6 +6,8 @@ import com.zendesk.maxwell.MaxwellContext;
 import com.zendesk.maxwell.row.RowMap;
 import com.zendesk.maxwell.row.RowMap.KeyFormat;
 import com.zendesk.maxwell.producer.partitioners.MaxwellKafkaPartitioner;
+import com.zendesk.maxwell.util.StoppableTask;
+import com.zendesk.maxwell.util.StoppableTaskState;
 import org.apache.kafka.clients.producer.Callback;
 import org.apache.kafka.clients.producer.KafkaProducer;
 import org.apache.kafka.clients.producer.ProducerRecord;
@@ -16,9 +18,9 @@ import org.apache.kafka.common.serialization.StringSerializer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.sql.SQLException;
 import java.util.Properties;
 import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.TimeoutException;
 
 
 class KafkaCallback implements Callback {
@@ -27,8 +29,10 @@ class KafkaCallback implements Callback {
 	private final BinlogPosition position;
 	private final String json;
 	private final String key;
+	private final MaxwellContext context;
 
-	public KafkaCallback(AbstractAsyncProducer.CallbackCompleter cc, BinlogPosition position, String key, String json) {
+	public KafkaCallback(MaxwellContext context, AbstractAsyncProducer.CallbackCompleter cc, BinlogPosition position, String key, String json) {
+		this.context = context;
 		this.cc = cc;
 		this.position = position;
 		this.key = key;
@@ -38,10 +42,13 @@ class KafkaCallback implements Callback {
 	@Override
 	public void onCompletion(RecordMetadata md, Exception e) {
 		if ( e != null ) {
-			LOGGER.error(e.getClass().getSimpleName() + " @ " + position + " -- " + key);
-			LOGGER.error(e.getLocalizedMessage());
 			if ( e instanceof RecordTooLargeException ) {
+				LOGGER.error(e.getClass().getSimpleName() + " @ " + position + " -- " + key);
+				LOGGER.error(e.getLocalizedMessage());
 				LOGGER.error("Considering raising max.request.size broker-side.");
+			} else {
+				context.terminate(e);
+				return;
 			}
 		} else {
 			if ( LOGGER.isDebugEnabled()) {
@@ -65,16 +72,20 @@ public class MaxwellKafkaProducer extends AbstractProducer {
 		this.queue = new ArrayBlockingQueue<>(100);
 		this.worker = new MaxwellKafkaProducerWorker(context, kafkaProperties, kafkaTopic, this.queue);
 		new Thread(this.worker, "maxwell-kafka-worker").start();
-
 	}
 
 	@Override
 	public void push(RowMap r) throws Exception {
 		this.queue.put(r);
 	}
+
+	@Override
+	public StoppableTask getStoppableTask() {
+		return this.worker;
+	}
 }
 
-class MaxwellKafkaProducerWorker extends AbstractAsyncProducer implements Runnable {
+class MaxwellKafkaProducerWorker extends AbstractAsyncProducer implements Runnable, StoppableTask {
 	static final Logger LOGGER = LoggerFactory.getLogger(MaxwellKafkaProducer.class);
 
 	private final KafkaProducer<String, String> kafka;
@@ -85,6 +96,8 @@ class MaxwellKafkaProducerWorker extends AbstractAsyncProducer implements Runnab
 	private final KeyFormat keyFormat;
 	private final boolean interpolateTopic;
 	private final ArrayBlockingQueue<RowMap> queue;
+	private Thread thread;
+	private StoppableTaskState taskState;
 
 	public MaxwellKafkaProducerWorker(MaxwellContext context, Properties kafkaProperties, String kafkaTopic, ArrayBlockingQueue<RowMap> queue) {
 		super(context);
@@ -111,16 +124,24 @@ class MaxwellKafkaProducerWorker extends AbstractAsyncProducer implements Runnab
 			keyFormat = KeyFormat.ARRAY;
 
 		this.queue = queue;
+		this.taskState = new StoppableTaskState("MaxwellKafkaProducerWorker");
 	}
 
 	@Override
 	public void run() {
+		this.thread = Thread.currentThread();
 		while ( true ) {
 			try {
 				RowMap row = queue.take();
+				if (!taskState.keepGoing()) {
+					taskState.stopped();
+					return;
+				}
 				this.push(row);
 			} catch ( Exception e ) {
-				throw new RuntimeException(e);
+				taskState.stopped();
+				context.terminate(e);
+				return;
 			}
 		}
 	}
@@ -158,8 +179,24 @@ class MaxwellKafkaProducerWorker extends AbstractAsyncProducer implements Runnab
 		if ( !KafkaCallback.LOGGER.isDebugEnabled() )
 			value = null;
 
-		KafkaCallback callback = new KafkaCallback(cc, r.getPosition(), key, value);
+		KafkaCallback callback = new KafkaCallback(context, cc, r.getPosition(), key, value);
 
 		kafka.send(record, callback);
+	}
+
+	@Override
+	public void requestStop() {
+		taskState.requestStop();
+		kafka.close();
+	}
+
+	@Override
+	public void awaitStop(Long timeout) throws TimeoutException {
+		taskState.awaitStop(thread, timeout);
+	}
+
+	@Override
+	public StoppableTask getStoppableTask() {
+		return this;
 	}
 }

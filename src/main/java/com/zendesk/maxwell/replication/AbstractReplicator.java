@@ -22,17 +22,15 @@ import java.util.Objects;
 public abstract class AbstractReplicator extends RunLoopProcess implements Replicator {
 	private static Logger LOGGER = LoggerFactory.getLogger(AbstractReplicator.class);
 	protected final String clientID;
-	protected final PositionStoreThread positionStoreThread;
 	protected final AbstractProducer producer;
 	protected final AbstractBootstrapper bootstrapper;
 	protected final String maxwellSchemaDatabaseName;
 	protected final TableCache tableCache = new TableCache();
 	protected Long lastHeartbeatRead;
 
-	public AbstractReplicator(String clientID, AbstractBootstrapper bootstrapper, PositionStoreThread positionStoreThread, String maxwellSchemaDatabaseName, AbstractProducer producer) {
+	public AbstractReplicator(String clientID, AbstractBootstrapper bootstrapper, String maxwellSchemaDatabaseName, AbstractProducer producer) {
 		this.clientID = clientID;
 		this.bootstrapper = bootstrapper;
-		this.positionStoreThread = positionStoreThread;
 		this.maxwellSchemaDatabaseName = maxwellSchemaDatabaseName;
 		this.producer = producer;
 	}
@@ -125,12 +123,6 @@ public abstract class AbstractReplicator extends RunLoopProcess implements Repli
 	 */
 	public void work() throws Exception {
 		RowMap row = getRow();
-
-		// todo: this is inelegant.  Ideally the outer code would monitor the
-		// position thread and stop us if it was dead.
-
-		if ( positionStoreThread.getException() != null )
-			throw positionStoreThread.getException();
 
 		if ( row == null )
 			return;
